@@ -23,6 +23,7 @@ setup(
             "dummy_passive_tag = dwm1001_driver.dummy_passive_tag_node:main",
             "active_tag = dwm1001_driver.active_tag_node:main",
             "dummy_active_tag = dwm1001_driver.dummy_active_tag_node:main",
+            "convoy_range = dwm1001_driver.convoy_range:main", #i added it , i did new colcon
         ]
     },
 )

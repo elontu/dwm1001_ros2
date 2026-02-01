@@ -1,0 +1,8 @@
+# dwm1001_launch/config/convoy_params.yaml
+convoy_range_finder:
+  ros__parameters:
+    d1: 0.5
+    d2: 0.5
+
+    #d1 represents the distance from the left side to the right side of the leader car in meters
+    #d2 represents the distance from the left side to the right side of the follower car in meters
