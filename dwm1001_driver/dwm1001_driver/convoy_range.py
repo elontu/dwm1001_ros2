@@ -10,8 +10,8 @@ class ConvoyRangeNode(Node):
         super().__init__('convoy_range_finder')
         
         # Declare parameters so they exist in the ROS2 system
-        self.declare_parameter('d1', 0.5)
-        self.declare_parameter('d2', 0.5)
+        self.declare_parameter('d1', 0.5) #distance between the two anchors on the leader vehicle
+        self.declare_parameter('d2', 0.5) #distance between the two anchors on the follower vehicle
         
         # Fetch the values
         self.d1 = self.get_parameter('d1').get_parameter_value().double_value
@@ -55,9 +55,9 @@ class ConvoyRangeNode(Node):
 
     # --- Geometric Functions ---
 
-    def median_theorem(self, a, b, d):
-        """Calculates the length of the median to side d."""
-        return np.sqrt((a**2 + b**2 - (d**2)/2)/2)
+    def median_theorem(self, a, b, c):
+        """Calculates the length of the median to side c."""
+        return np.sqrt((a**2 + b**2) / 2 - (c**2 / 4))
 
     def cosine_law_angle(self, a, b, c):
         """Calculates the angle opposite to side c using the Law of Cosines."""
@@ -73,14 +73,20 @@ class ConvoyRangeNode(Node):
         """
         # Distances from follower anchors to leader center
         m1 = self.median_theorem(r1, r2, d1)
-        m2 = self.median_theorem(r3, r4, d1)
+        m2 = self.median_theorem(r3, r4, d2)
         
-        # Final range between vehicle centers
+        # Final range  and angle between vehicle centers
         range_val = self.median_theorem(m1, m2, d2)
+        angle = self.cosine_law_angle(range_val, d2/2, m2)
 
-        # Azimuth calculation (Angle relative to vehicle heading)
-        # Pi/2 offset assumes 0 is straight ahead
-        azimuth = np.pi/2 - self.cosine_law_angle(range_val, d2/2, m2)
+        # Determine Sign (Left or Right)
+        # If distance from Left anchor (m1) is greater than Right anchor (m2), 
+        # the leader is to the right (positive angle).
+        #TODO ensure this logic is correct for the task
+        if m1 > m2:
+            azimuth = np.pi/2 - angle
+        else:
+            azimuth = -(np.pi/2 - angle)
 
         return range_val, azimuth
 
