@@ -59,10 +59,6 @@ class ActiveTagNode(Node):
         
         # Flag to ensure wakeup runs only once
         self._wakeup_done = False
-
-        self.dwm_handle.start_position_reporting()
-        self.get_logger().info("Started position reporting.")
-        self.get_logger().debug("Position reporting started via dwm1001 library")
         
         # Get publish rate parameter and create timer
         timer_period = 1.0 / publish_rate
@@ -100,38 +96,45 @@ class ActiveTagNode(Node):
         self.get_logger().debug(f"Wakeup max attempts: {max_attempts}")
         
         # Try up to max_attempts times (total ~max_attempts seconds) to cover boot time and beeping
-        for i in range(max_attempts):
+        decoded_data = ""
+        i = 0
+        while "leaps>" not in decoded_data : #and i < max_attempts TODO delete max_attempts
+            i += 1
             # Send ENTER to wake the device and get the prompt
-            self.get_logger().debug(f"Wakeup attempt {i+1}/{max_attempts}: Sending ENTER command")
+            self.get_logger().debug(f"Wakeup attempt {i}/{max_attempts}: Sending ENTER command")
             self.dwm_handle.serial_handle.write(b'\r')
             time.sleep(0.5)  # sleep for 0.5 second
             
             bytes_waiting = self.dwm_handle.serial_handle.in_waiting
             self.get_logger().debug(f"Bytes waiting in serial buffer: {bytes_waiting}")
             
+            decoded_data = ""
             if bytes_waiting > 0:
                 # Read all waiting data (including the Copyright messages we saw in Putty)
                 data = self.dwm_handle.serial_handle.read(bytes_waiting)
                 decoded_data = data.decode('utf-8', errors='ignore')
                 self.get_logger().debug(f"Received data (length={len(decoded_data)}): {repr(decoded_data[:100])}")  # Log first 100 chars
-                
-                # Check whether the device printed the prompt indicating readiness
-                if "leaps>" in decoded_data:
-                    self.get_logger().info(f"Device synchronized! (Prompt detected after {i+1} attempts)")
-                    self.get_logger().debug(f"Full response: {repr(decoded_data)}")
-                    is_ready = True
-                    break
             
-            if (i+1) % 10 == 0:
-                self.get_logger().info(f"Still waiting for prompt... (Attempt {i+1}/{max_attempts})")
+            if i % 10 == 0:
+                self.get_logger().info(f"Still waiting for prompt... (Attempt {i}/{max_attempts})")
             else:
-                self.get_logger().debug(f"Attempt {i+1}/{max_attempts}: No prompt detected yet")
+                self.get_logger().debug(f"Attempt {i}/{max_attempts}: No prompt detected yet")
+
+        if "leaps>" in decoded_data:
+            self.get_logger().info(f"Device synchronized! (Prompt detected after {i} attempts)")
+            self.get_logger().debug(f"Full response: {repr(decoded_data)}")
+            is_ready = True
+        else:
+            is_ready = False
 
         if not is_ready:
             self.get_logger().error(f"FAILED to find 'leaps>' prompt after {max_attempts} attempts. Device might be unresponsive.")
             self.get_logger().debug("Wakeup sequence completed unsuccessfully")
         else:
             self.get_logger().debug("Wakeup sequence completed successfully")
+            self.dwm_handle.start_position_reporting()
+            self.get_logger().info("Started position reporting.")
+            self.get_logger().debug("Position reporting started via dwm1001 library")
 
     def _read_serial_data(self) -> None:
         """Read and process serial data from DWM1001 device."""
