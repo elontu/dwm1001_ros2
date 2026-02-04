@@ -18,13 +18,13 @@ from rclpy.logging import LoggingSeverity
 
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
-import dwm1001_driver.dwm1001_forked as dwm1001
 import serial
 import time
 import subprocess
 import re
 import os
 import stat
+from . import dwm1001_forked as dwm1001_forked
 from dwm1001_msg.msg import NamedValueArray, NamedValue
 
 
@@ -33,6 +33,10 @@ class ActiveTagNode(Node):
 
         super().__init__("dwm_active", allow_undeclared_parameters=True)
         self.get_logger().debug("Initializing ActiveTagNode...")
+        
+        # Initialize device handles to None for cleanup safety
+        self.serial_handle = None
+        self.dwm_handle = None
         
         self._declare_parameters()
         self.get_logger().debug("Parameters declared")
@@ -62,11 +66,51 @@ class ActiveTagNode(Node):
         # Check and validate serial port availability before opening
         validated_port = self._check_serial_ports(serial_port_param)
         
-        serial_handle = self._open_serial_port(validated_port)
-        self.get_logger().debug(f"Serial handle created: {serial_handle}")
+        # Store serial handle as instance variable for cleanup
+        self.serial_handle = self._open_serial_port(validated_port)
+        self.get_logger().debug(f"Serial handle created: {self.serial_handle}")
         
-        self.dwm_handle = dwm1001.ActiveTag(serial_handle)
-        self.get_logger().debug("DWM1001 ActiveTag handle created")
+        # Get max initialization attempts parameter
+        max_init_attempts = int(self.get_parameter("init_max_attempts").value)
+        self.get_logger().debug(f"Max initialization attempts: {max_init_attempts}")
+        
+        # Retry initialization up to max_init_attempts times
+        self.dwm_handle = None
+        for attempt in range(1, max_init_attempts + 1):
+            try:
+                self.get_logger().info(f"Initializing DWM1001 device (attempt {attempt}/{max_init_attempts})...")
+                self.dwm_handle = dwm1001_forked.ActiveTag(self.serial_handle)
+                self.get_logger().info(f"DWM1001 ActiveTag handle created successfully on attempt {attempt}")
+                break
+            except (OSError, IOError, serial.SerialException) as e:
+                if attempt < max_init_attempts:
+                    self.get_logger().warn(f"I/O error on attempt {attempt}/{max_init_attempts}: {e}. Retrying in 0.5 seconds...")
+                    time.sleep(0.5)
+                else:
+                    # Cleanup before raising error
+                    self._cleanup_device()
+                    error_msg = f"I/O error when initializing DWM1001 device after {max_init_attempts} attempts: {e}. " \
+                               f"Check if device is connected, powered on, and not in use by another process. " \
+                               f"Try unplugging and replugging the USB device."
+                    self.get_logger().error(error_msg)
+                    raise RuntimeError(error_msg) from e
+            except Exception as e:
+                if attempt < max_init_attempts:
+                    self.get_logger().warn(f"Unexpected error on attempt {attempt}/{max_init_attempts}: {e}. Retrying in 0.5 seconds...")
+                    time.sleep(0.5)
+                else:
+                    # Cleanup before raising error
+                    self._cleanup_device()
+                    error_msg = f"Unexpected error when initializing DWM1001 device after {max_init_attempts} attempts: {e}"
+                    self.get_logger().error(error_msg)
+                    raise RuntimeError(error_msg) from e
+        
+        if self.dwm_handle is None:
+            # Cleanup before raising error
+            self._cleanup_device()
+            error_msg = f"Failed to initialize DWM1001 device after {max_init_attempts} attempts"
+            self.get_logger().error(error_msg)
+            raise RuntimeError(error_msg)
         
         # Flag to ensure wakeup runs only once
         self._wakeup_done = False
@@ -361,12 +405,19 @@ class ActiveTagNode(Node):
             read_only=True,
         )
         
+        init_max_attempts_descriptor = ParameterDescriptor(
+            description="Maximum number of attempts to initialize DWM1001 device (default: 5)",
+            type=ParameterType.PARAMETER_INTEGER,
+            read_only=True,
+        )
+        
         self.declare_parameter("namespace", "dwm1001", namespace_descriptor)
         self.declare_parameter("frame_id", "dwm1001", frame_id_descriptor)
         self.declare_parameter("serial_port", "/dev/ttyACM1", serial_port_descriptor)
         self.declare_parameter("publish_rate", 25.0, publish_rate_descriptor)
         self.declare_parameter("wakeup_max_attempts", 150, wakeup_max_attempts_descriptor)
-        self.declare_parameter("debug_level", "DEBUG", debug_level_descriptor)
+        self.declare_parameter("debug_level", "INFO", debug_level_descriptor)
+        self.declare_parameter("init_max_attempts", 5, init_max_attempts_descriptor)
 
     def _set_logger_level(self):
         """Set the logger level based on the debug_level parameter."""
@@ -387,6 +438,42 @@ class ActiveTagNode(Node):
         else:
             self.get_logger().warn(f"Invalid debug_level '{debug_level_str}'. Valid values: DEBUG, INFO, WARN, ERROR, FATAL. Using INFO.")
             self.get_logger().set_level(LoggingSeverity.INFO)
+
+    def _cleanup_device(self):
+        """Clean up device resources - stop position reporting and close serial port."""
+        try:
+            if hasattr(self, 'dwm_handle') and self.dwm_handle is not None:
+                try:
+                    self.get_logger().debug("Stopping position reporting...")
+                    self.dwm_handle.stop_position_reporting()
+                    self.get_logger().debug("Position reporting stopped")
+                except Exception as e:
+                    self.get_logger().warn(f"Error stopping position reporting: {e}")
+                
+                try:
+                    self.get_logger().debug("Exiting shell mode...")
+                    self.dwm_handle.exit_shell_mode()
+                    self.get_logger().debug("Shell mode exited")
+                except Exception as e:
+                    self.get_logger().warn(f"Error exiting shell mode: {e}")
+        except Exception as e:
+            self.get_logger().warn(f"Error during dwm_handle cleanup: {e}")
+        
+        try:
+            if hasattr(self, 'serial_handle') and self.serial_handle is not None:
+                if self.serial_handle.is_open:
+                    self.get_logger().info(f"Closing serial port: {self.serial_handle.port}")
+                    self.serial_handle.close()
+                    self.get_logger().debug("Serial port closed")
+        except Exception as e:
+            self.get_logger().warn(f"Error closing serial port: {e}")
+
+    def destroy_node(self):
+        """Override destroy_node to ensure proper cleanup."""
+        self.get_logger().debug("Destroying ActiveTagNode, cleaning up device...")
+        self._cleanup_device()
+        super().destroy_node()
+        self.get_logger().debug("ActiveTagNode destroyed")
 
     def timer_callback(self):
         self.get_logger().debug("Timer callback triggered")
