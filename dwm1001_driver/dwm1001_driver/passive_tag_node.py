@@ -18,7 +18,7 @@ from rclpy.node import Node
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from geometry_msgs.msg import PointStamped, TransformStamped
 
-import dwm1001
+import dwm1001_driver.dwm1001_forked as dwm1001
 import serial
 from collections import deque
 

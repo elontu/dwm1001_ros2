@@ -13,3 +13,35 @@ This package requires the installation of our [`pydwm1001`](https://github.com/t
 - [`dwm1001_launch`](dwm1001_launch/README.md): The launch configurations for active and passive node.
 - [`dwm1001_transform`](dwm1001_transform/README.md): A package that provides transformations from the `dwm1001` frame to the `map` frame.
 - [`dwm1001_visualization`](dwm1001_visualization/README.md): This package provides visualizations in `rviz` for a DWM1001 deployment.
+
+# Find all relevant ports using 
+ls -la /dev/ttyACM* 2>/dev/null; echo "---"; dmesg | grep -i "ttyACM\|cdc_acm"
+ 
+ # How to find if it's publish or not 
+ /dwm1001/dwm1001/uwb_ranges
+ros2 topic hz /dwm1001/dwm1001/uwb_ranges 
+ros2 topic echo /dwm1001/dwm1001/uwb_ranges  --once 
+
+## How to use this repositroy under algo / ros2 workspace 
+how to add and compile this code for deveoper purposes 
+
+
+    # Remove paths, handling symlinks properly (remove symlink itself, not the target file)
+    for p in /ros2_ws/src/dwm1001_ros2 /ros2_ws/src/dwm1001_driver src/dwm1001_ros2/dwm1001_driver /ros2_ws/install/dwm1001_driver/ /ros2_ws/build/dwm1001_driver/ /ros2_ws/local/dwm1001_driver/; do [ -L "$p" ] && rm "$p" || rm -rf "$p" 2>/dev/null; done
+
+    ln -s /perception_code/ros_recording_system/src/dwm1001_ros2/ /ros2_ws/src/ && cd /ros2_ws && colcon build --symlink-install --packages-select dwm1001_driver && source /ros2_ws/install/setup.bash  
+    pip list | grep dwm1001_driver
+
+    ros2 pkg list | grep dwm1001_driver 
+    ros2 pkg executables dwm1001_driver
+    # print all executables for each package 
+    for pkg in $(ros2 pkg list | grep -E 'dwm1001_driver'); do
+        echo "=== Executables for $pkg ==="
+        ros2 pkg executables $pkg
+        echo
+    done
+
+
+
+
+    /home/robo01/PycharmProjects/pythonProject

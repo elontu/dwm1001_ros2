@@ -14,12 +14,17 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.logging import LoggingSeverity
 
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
-import dwm1001
+import dwm1001_driver.dwm1001_forked as dwm1001
 import serial
 import time
+import subprocess
+import re
+import os
+import stat
 from dwm1001_msg.msg import NamedValueArray, NamedValue
 
 
@@ -31,6 +36,9 @@ class ActiveTagNode(Node):
         
         self._declare_parameters()
         self.get_logger().debug("Parameters declared")
+        
+        # Set logger level from parameter
+        self._set_logger_level()
         
         # Get all parameters
         namespace = self.get_parameter("namespace").value
@@ -51,7 +59,10 @@ class ActiveTagNode(Node):
         
         self.get_logger().info(f"Provided serial port: '{serial_port_param}'")
         
-        serial_handle = self._open_serial_port(serial_port_param)
+        # Check and validate serial port availability before opening
+        validated_port = self._check_serial_ports(serial_port_param)
+        
+        serial_handle = self._open_serial_port(validated_port)
         self.get_logger().debug(f"Serial handle created: {serial_handle}")
         
         self.dwm_handle = dwm1001.ActiveTag(serial_handle)
@@ -65,6 +76,122 @@ class ActiveTagNode(Node):
         self.timer = self.create_timer(timer_period, self.timer_callback)
         self.get_logger().info(f"Timer created with publish rate: {publish_rate} Hz (period: {timer_period}s)")
         self.get_logger().debug(f"Timer callback will be called every {timer_period} seconds")
+
+    def _check_serial_ports(self, configured_port: str) -> str:
+        """
+        Check available ttyACM devices and validate/update serial_port configuration.
+        Returns the validated port path to use.
+        """
+        self.get_logger().debug(f"Checking serial ports. Configured port: '{configured_port}'")
+        
+        # Run command to list ttyACM devices and dmesg output
+        cmd = "ls -la /dev/ttyACM* 2>/dev/null; echo '---'; dmesg | grep -i 'ttyACM\\|cdc_acm'"
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode != 0:
+                error_msg = f"Failed to check serial ports: {result.stderr}"
+                self.get_logger().error(error_msg)
+                raise RuntimeError(error_msg)
+            
+            output = result.stdout
+            self.get_logger().debug(f"Serial port check output:\n{output}")
+            
+            # Extract ttyACM device paths from output
+            ttyacm_pattern = r'/dev/ttyACM\d+'
+            found_ports = re.findall(ttyacm_pattern, output)
+            
+            if not found_ports:
+                error_msg = "No ttyACM devices found. Check device connection."
+                self.get_logger().error(error_msg)
+                raise RuntimeError(error_msg)
+            
+            # Remove duplicates and sort
+            found_ports = sorted(list(set(found_ports)))
+            
+            # Check if configured serial port is in the found ports
+            port_to_use = configured_port if configured_port in found_ports else found_ports[0]
+            if configured_port not in found_ports:
+                self.get_logger().warn(
+                    f"Configured serial port {configured_port} not found. "
+                    f"Using first available port: {port_to_use}"
+                )
+            
+            # Validate port is writable and not locked
+            self._validate_port_writable(port_to_use)
+            
+            self.get_logger().info(f"Found serial port {port_to_use} as listed under configuration")
+            return port_to_use
+                
+        except subprocess.TimeoutExpired:
+            error_msg = "Timeout while checking serial ports"
+            self.get_logger().error(error_msg)
+            raise RuntimeError(error_msg)
+        except Exception as e:
+            error_msg = f"Error checking serial ports: {str(e)}"
+            self.get_logger().error(error_msg)
+            raise RuntimeError(error_msg)
+    
+    def _validate_port_writable(self, port_path: str):
+        """
+        Validate that the serial port is writable and not locked by another process.
+        """
+        # Check if file exists and is a character device
+        if not os.path.exists(port_path):
+            error_msg = f"Serial port {port_path} does not exist"
+            self.get_logger().error(error_msg)
+            raise RuntimeError(error_msg)
+        
+        if not stat.S_ISCHR(os.stat(port_path).st_mode):
+            error_msg = f"{port_path} is not a character device"
+            self.get_logger().error(error_msg)
+            raise RuntimeError(error_msg)
+        
+        # Check if port is locked by another process
+        try:
+            lsof_result = subprocess.run(
+                ['lsof', port_path],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if lsof_result.returncode == 0 and lsof_result.stdout.strip():
+                processes = lsof_result.stdout.strip().split('\n')[1:]  # Skip header
+                pid_list = [line.split()[1] for line in processes if line.strip()]
+                error_msg = f"Serial port {port_path} is locked by process(es): {', '.join(set(pid_list))}"
+                self.get_logger().error(error_msg)
+                raise RuntimeError(error_msg)
+        except FileNotFoundError:
+            # lsof not available, try fuser instead
+            try:
+                fuser_result = subprocess.run(
+                    ['fuser', port_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                if fuser_result.returncode == 0:
+                    error_msg = f"Serial port {port_path} is in use by another process"
+                    self.get_logger().error(error_msg)
+                    raise RuntimeError(error_msg)
+            except FileNotFoundError:
+                self.get_logger().debug("lsof/fuser not available, skipping lock check")
+        except subprocess.TimeoutExpired:
+            self.get_logger().debug("Timeout checking for locked port (may be OK)")
+        
+        # Check write permissions
+        if not os.access(port_path, os.W_OK):
+            error_msg = f"Serial port {port_path} is not writable. Check permissions (user may need dialout group)"
+            self.get_logger().error(error_msg)
+            raise RuntimeError(error_msg)
+        
+        self.get_logger().debug(f"Serial port {port_path} is writable and available")
 
     def _open_serial_port(self, serial_port: str) -> serial.Serial:
         self.get_logger().debug(f"Attempting to open serial port: '{serial_port}'")
@@ -113,7 +240,7 @@ class ActiveTagNode(Node):
                 # Read all waiting data (including the Copyright messages we saw in Putty)
                 data = self.dwm_handle.serial_handle.read(bytes_waiting)
                 decoded_data = data.decode('utf-8', errors='ignore')
-                self.get_logger().debug(f"Received data (length={len(decoded_data)}): {repr(decoded_data[:100])}")  # Log first 100 chars
+                self.get_logger().debug(f"Received data {decoded_data} (length={len(decoded_data)}): {repr(decoded_data[:100])}")  # Log first 100 chars
             
             if i % 10 == 0:
                 self.get_logger().info(f"Still waiting for prompt... (Attempt {i}/{max_attempts})")
@@ -205,7 +332,7 @@ class ActiveTagNode(Node):
         )
         
         serial_port_descriptor = ParameterDescriptor(
-            description="Device file or COM port associated with DWM1001 (default: /dev/ttyACM0)",
+            description="Device file or COM port associated with DWM1001 (default: /dev/ttyACM*)",
             type=ParameterType.PARAMETER_STRING,
             read_only=True,
         )
@@ -228,11 +355,38 @@ class ActiveTagNode(Node):
             read_only=True,
         )
         
+        debug_level_descriptor = ParameterDescriptor(
+            description="Logging level: DEBUG, INFO, WARN, ERROR, FATAL (default: INFO)",
+            type=ParameterType.PARAMETER_STRING,
+            read_only=True,
+        )
+        
         self.declare_parameter("namespace", "dwm1001", namespace_descriptor)
         self.declare_parameter("frame_id", "dwm1001", frame_id_descriptor)
-        self.declare_parameter("serial_port", "/dev/ttyACM0", serial_port_descriptor)
+        self.declare_parameter("serial_port", "/dev/ttyACM1", serial_port_descriptor)
         self.declare_parameter("publish_rate", 25.0, publish_rate_descriptor)
         self.declare_parameter("wakeup_max_attempts", 150, wakeup_max_attempts_descriptor)
+        self.declare_parameter("debug_level", "DEBUG", debug_level_descriptor)
+
+    def _set_logger_level(self):
+        """Set the logger level based on the debug_level parameter."""
+        debug_level_str = self.get_parameter("debug_level").value.upper()
+        
+        level_mapping = {
+            "DEBUG": LoggingSeverity.DEBUG,
+            "INFO": LoggingSeverity.INFO,
+            "WARN": LoggingSeverity.WARN,
+            "WARNING": LoggingSeverity.WARN,
+            "ERROR": LoggingSeverity.ERROR,
+            "FATAL": LoggingSeverity.FATAL,
+        }
+        
+        if debug_level_str in level_mapping:
+            self.get_logger().set_level(level_mapping[debug_level_str])
+            self.get_logger().info(f"Logger level set to: {debug_level_str}")
+        else:
+            self.get_logger().warn(f"Invalid debug_level '{debug_level_str}'. Valid values: DEBUG, INFO, WARN, ERROR, FATAL. Using INFO.")
+            self.get_logger().set_level(LoggingSeverity.INFO)
 
     def timer_callback(self):
         self.get_logger().debug("Timer callback triggered")
@@ -251,8 +405,17 @@ def main(args=None):
     rclpy.init(args=args)
     rclpy.logging.get_logger("dwm_active").debug("Starting DWM1001 ActiveTagNode main()")
 
-    active_tag = ActiveTagNode()
-    rclpy.logging.get_logger("dwm_active").debug("ActiveTagNode created, starting spin")
+    try:
+        active_tag = ActiveTagNode()
+        rclpy.logging.get_logger("dwm_active").debug("ActiveTagNode created, starting spin")
+    except RuntimeError as e:
+        rclpy.logging.get_logger("dwm_active").fatal(f"Failed to initialize node: {e}")
+        rclpy.shutdown()
+        exit(1)
+    except Exception as e:
+        rclpy.logging.get_logger("dwm_active").fatal(f"Unexpected error during node initialization: {e}")
+        rclpy.shutdown()
+        exit(1)
     
     try:
         rclpy.spin(active_tag)
