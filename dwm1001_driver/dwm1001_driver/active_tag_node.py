@@ -56,10 +56,10 @@ class ActiveTagNode(Node):
                                 f"wakeup_max_attempts: {wakeup_max_attempts}")
         
         # Build topic names with namespace
-        uwb_ranges_topic = f"{namespace}/{frame_id}/uwb_ranges"
+        uwb_ranges_topic = f"/{namespace}/{frame_id}/uwb_ranges"
         
         self.range_publisher = self.create_publisher(NamedValueArray, uwb_ranges_topic, 10)
-        self.get_logger().debug(f"Created range_publisher on topic '{uwb_ranges_topic}'")
+        self.get_logger().info(f"Created range_publisher on topic '{uwb_ranges_topic}'")
         
         self.get_logger().info(f"Provided serial port: '{serial_port_param}'")
         
