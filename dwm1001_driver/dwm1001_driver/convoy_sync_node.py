@@ -17,7 +17,7 @@ ROS2 node that subscribes to two UWB range topics (left and right), synchronizes
 them with ApproximateTimeSynchronizer, applies convoy_range-style calculation.
 # and publishes ConvoyRangeStamped (x_m, y_m, r, a, r_geo, a_geo).
 """
-
+import copy
 import math
 import struct
 from typing import Optional, Tuple
@@ -32,6 +32,8 @@ from sensor_msgs.msg import PointCloud2, PointField
 
 from builtin_interfaces.msg import Time
 from dwm1001_msg.msg import NamedValueArray
+from geometry_msgs.msg import PointStamped
+
 # from dwm1001_msg.msg import ConvoyRangeStamped
         
 # --- Insert at top of file ---
@@ -162,14 +164,14 @@ def get_coord(r1: float, r2: float, d: float) -> Tuple[float, float]:
 
 
 def get_range_angle(x: float, y: float, d: float, l: float) -> Tuple[float, float]:
-    """Range r and angle a [degrees] from convoy geometry (midpoint x,y, anchor spacing d, lidar offset l)."""
+    """Range r and angle a [radians] from convoy geometry (midpoint x,y, anchor spacing d, lidar offset l)."""
     x, y, d, l = float(x), float(y), float(d), float(l)
     half_d = d * 0.5
     dx = abs(x - half_d)
     init_r = math.sqrt((x - half_d) ** 2 + y * y)
     init_a = math.atan2(dx, y)
     r = cosine_law_line(init_r, l, init_a)
-    a = math.degrees(math.atan2(dx, y - l))
+    a = math.atan2(dx, y - l)
     return r, a
 
 
@@ -217,7 +219,7 @@ def convoy_range_from_ranges(
         half_d = d * 0.5
         alpha = _HALF_PI - cosine_law_angle(m, half_d, m2)
         r_geo = cosine_law_line(l, m, alpha)
-        a_geo = math.degrees(sine_law(m, r_geo, alpha) - _HALF_PI)
+        a_geo = sine_law(m, r_geo, alpha) - _HALF_PI  # [radians]
 
         result = (x_m, y_m, r, a, r_geo, a_geo)
         if not all(math.isfinite(v) for v in result):
@@ -227,36 +229,50 @@ def convoy_range_from_ranges(
         return None
 
 
+from rclpy.parameter import Parameter
+from rclpy.clock import JumpThreshold
+from rclpy.duration import Duration
+
 class ConvoySyncNode(Node):
     """Subscribes to two uwb_ranges topics, syncs them, runs convoy_range."""
 
     def __init__(self) -> None:
-        super().__init__("convoy_sync", allow_undeclared_parameters=True)
+        super().__init__("convoy_sync", allow_undeclared_parameters=True, parameter_overrides=[
+                Parameter('use_sim_time', Parameter.Type.BOOL, True)
+            ])
+                
         self._declare_parameters()
+        
+        # Create a Jump Handler to detect when the bag loops
+        # This triggers if time jumps back by more than 1 second
+        # 1. Use 'create_jump_callback'
+        # 2. Argument names are 'min_backward' and 'min_forward'
+        # 3. Store the return value in self.jump_handle to prevent garbage collection
+        # 1. Define the threshold with all required keyword-only arguments
+        threshold = JumpThreshold(
+            min_forward=None,                    # Ignore forward jumps
+            min_backward=Duration(seconds=-1.0), # Trigger on backward jump > 1s
+            on_clock_change=True                 # Trigger if clock source changes
+        )
+
+        self.jump_handle = self.get_clock().create_jump_callback(
+            threshold=threshold,
+            post_callback=self.time_jump_callback
+        )
 
         left_topic = self.get_parameter("left_uwb_ranges_topic").value
         right_topic = self.get_parameter("right_uwb_ranges_topic").value
         self.d = self.get_parameter("d").value
         self.l = self.get_parameter("l").value
-        frame_id = self.get_parameter("frame_id").value
-        sync_slop = self.get_parameter("sync_slop").value
-        queue_size = self.get_parameter("sync_queue_size").value
+
 
         # self.convoy_publisher = self.create_publisher(
         #     ConvoyRangeStamped,
         #     f"/convoy_sync/{frame_id}/convoy_range",
         #     10,
         # )
-
-        self.left_sub = message_filters.Subscriber(self, NamedValueArray, left_topic)
-        self.right_sub = message_filters.Subscriber(self, NamedValueArray, right_topic)
-        self.sync = message_filters.ApproximateTimeSynchronizer(
-            [self.left_sub, self.right_sub],
-            queue_size=queue_size,
-            slop=sync_slop,
-        )
-        self.sync.registerCallback(self._sync_callback)
-
+        
+        self.setup_synchronizer()
         # Transform base_link <- left_tag.frame_id; computed once on first sync callback
         self._base_link_frame = self.get_parameter("base_link_frame").value
         self._tf_base_link_from_left_tag: Optional[np.ndarray] = None
@@ -274,10 +290,33 @@ class ConvoySyncNode(Node):
             "convoy_sync/debug_pointcloud",
             debug_pc_qos,
         )
+        self._debug_range_azimuth_analytic_pub = self.create_publisher(PointStamped, "convoy_sync/debug/range_azimuth_analytic", 10)
+        self._debug_range_azimuth_geometric_pub = self.create_publisher(PointStamped, "convoy_sync/debug/range_azimuth_geometric", 10)
 
         self.get_logger().info(
             f"ConvoySync: subscribed to left={left_topic}, right={right_topic} (d={self.d}, l={self.l})"
         )
+        
+    def setup_synchronizer(self):   
+        left_topic = self.get_parameter("left_uwb_ranges_topic").value
+        right_topic = self.get_parameter("right_uwb_ranges_topic").value
+        # frame_id = self.get_parameter("frame_id").value
+        sync_slop = self.get_parameter("sync_slop").value
+        queue_size = self.get_parameter("sync_queue_size").value     
+        
+        self.left_sub = message_filters.Subscriber(self, NamedValueArray, left_topic)
+        self.right_sub = message_filters.Subscriber(self, NamedValueArray, right_topic)
+        self.sync = message_filters.ApproximateTimeSynchronizer(
+            [self.left_sub, self.right_sub],
+            queue_size=queue_size,
+            slop=sync_slop,
+        )
+        self.sync.registerCallback(self._sync_callback)
+
+    def time_jump_callback(self, jump_info):
+        self.get_logger().warn("Time jump detected (Bag likely looped)! Resetting buffers...")
+        # To reset message_filters in Python, the easiest way is to re-initialize the Synchronizer
+        self.setup_synchronizer()
 
     def _declare_parameters(self):
         self.declare_parameter(
@@ -307,7 +346,7 @@ class ConvoySyncNode(Node):
         )
         self.declare_parameter(
             "sync_slop",
-            0.05,
+            0.1,
             ParameterDescriptor(description="ApproximateTime sync slop [s]", type=ParameterType.PARAMETER_DOUBLE),
         )
         self.declare_parameter(
@@ -325,19 +364,27 @@ class ConvoySyncNode(Node):
             True,
             ParameterDescriptor(description="If true, publish (x_m, y_m, z_m) as a PointCloud2 for debugging", type=ParameterType.PARAMETER_BOOL),
         )
+        self.declare_parameter(
+            "publish_debug_scalars",
+            True,
+            ParameterDescriptor(description="If true, publish r, a, r_geo, a_geo as Float64 (angles in deg)", type=ParameterType.PARAMETER_BOOL),
+        )
 
     def _sync_callback(self, left_msg: NamedValueArray, right_msg: NamedValueArray):
+        
+        self.get_logger().fatal(f"Sync callback: left_msg: {left_msg} right_msg: {right_msg}")
+        
         # Fetch transform base_link <- left_tag.frame_id once
-        if self._tf_base_link_from_left_tag is None:
-            left_tag_frame = left_msg.header.frame_id
-            self._tf_base_link_from_left_tag, self._trans_base_link_from_left_tag = (
-                StaticTransformFetcher.get_transform(self, self._base_link_frame, left_tag_frame)
-            )
-            if self._tf_base_link_from_left_tag is None:
-                self.get_logger().warn(
-                    f"Could not get transform {self._base_link_frame} <- {left_tag_frame}; skipping."
-                )
-                return
+        # if self._tf_base_link_from_left_tag is None:
+        #     left_tag_frame = left_msg.header.frame_id
+        #     self._tf_base_link_from_left_tag, self._trans_base_link_from_left_tag = (
+        #         StaticTransformFetcher.get_transform(self, self._base_link_frame, left_tag_frame)
+        #     )
+        #     if self._tf_base_link_from_left_tag is None:
+        #         self.get_logger().warn(
+        #             f"Could not get transform {self._base_link_frame} <- {left_tag_frame}; skipping."
+        #         )
+        #         return
 
         self.get_logger().info(f"Sync callback: left_msg: {left_msg}")
         self.get_logger().info(f"Sync callback: right_msg: {right_msg}")
@@ -352,18 +399,19 @@ class ConvoySyncNode(Node):
             self.get_logger().warn("Convoy range computation failed (invalid geometry); skipping.")
             return
         x_m, y_m, r, a, r_geo, a_geo = result
-        z_m = self._trans_base_link_from_left_tag.transform.translation.z
+        # z_m = self._trans_base_link_from_left_tag.transform.translation.z
+        # TODO - get this value from tf 
+        z_m = 2.47
+        
         # # Apply cached transform: point (x_m, y_m, 0) in left_tag frame -> base_link
         # p_left = np.array([x_m, y_m, 0.0, 1.0])
         # p_base = self._tf_base_link_from_left_tag @ p_left
         # x_m_base, y_m_base, z_m_base = float(p_base[0]), float(p_base[1]), float(p_base[2])
 
-        return 
-        
         if self.get_parameter("publish_debug_pointcloud").value:
             pc = PointCloud2()
+            pc.header = copy.deepcopy(left_msg.header)
             pc.header.stamp = _mean_timestamp(left_msg.header.stamp, right_msg.header.stamp)
-            pc.header.frame_id = self._base_link_frame
             pc.height = 1
             pc.width = 1
             pc.fields = [
@@ -374,8 +422,21 @@ class ConvoySyncNode(Node):
             pc.is_bigendian = False
             pc.point_step = 12
             pc.row_step = 12
-            pc.data = struct.pack("fff", x_m, y_m, z_m)
+            pc.data = struct.pack("fff", y_m, x_m, 0.0)
             self._debug_pc_pub.publish(pc)
+
+        if self.get_parameter("publish_debug_scalars").value:
+            stamp = _mean_timestamp(left_msg.header.stamp, right_msg.header.stamp)
+            def _range_azimuth_point(range_val: float, azimuth_deg: float) -> PointStamped:
+                m = PointStamped()
+                m.header = copy.deepcopy(left_msg.header)
+                m.header.stamp = stamp
+                m.point.x = float(range_val)
+                m.point.y = float(azimuth_deg)
+                m.point.z = 0.0
+                return m
+            self._debug_range_azimuth_analytic_pub.publish(_range_azimuth_point(r, math.degrees(a)))
+            self._debug_range_azimuth_geometric_pub.publish(_range_azimuth_point(r_geo, math.degrees(a_geo)))
 
         # out = ConvoyRangeStamped()
         # out.header.stamp = _mean_timestamp(left_msg.header.stamp, right_msg.header.stamp)
@@ -383,20 +444,35 @@ class ConvoySyncNode(Node):
         # out.x_m = x_m_base
         # out.y_m = y_m_base
         # out.r = r
-        # out.a = a
+        # out.a = math.degrees(a)
         # out.r_geo = r_geo
-        # out.a_geo = a_geo
+        # out.a_geo = math.degrees(a_geo)
         # self.convoy_publisher.publish(out)
 
 
 def main(args=None):
     rclpy.init(args=args)
+    
     node = ConvoySyncNode()
+    # Matplotlib must run in the main thread; prefer single-thread executor when visual2d is on.
+    # TODO: make this code run in multi thread executor - this is an open bug at this point 
+    # TODO - make it work from multi-threaded executor as well
+    if True:
+        executor = rclpy.executors.SingleThreadedExecutor()
+    else:
+        executor = rclpy.executors.MultiThreadedExecutor(num_threads=6)
+        
+    executor.add_node(node)
+
     try:
-        rclpy.spin(node)
+        executor.spin()
+    except KeyboardInterrupt:
+        node.get_logger().info("Shutdown requested (Ctrl+C), stopping...")
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
+        
 
 
 if __name__ == "__main__":

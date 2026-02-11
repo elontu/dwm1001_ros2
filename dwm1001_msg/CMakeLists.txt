@@ -26,6 +26,8 @@ message("Generate custom interfaces for dwm1001_msg")
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/NamedValue.msg"
   "msg/NamedValueArray.msg"
+  "msg/ConvoyRangeStamped.msg"
+  "msg/ScalarStamped.msg"
   DEPENDENCIES
   std_msgs
 )

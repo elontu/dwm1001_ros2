@@ -4,7 +4,7 @@ This repository tracks the documentation and source for the ROS2 driver and supp
 The HIVE Lab uses these sensors as a reasonable, low cost alternative to a full motion capture system for locating robots in a space.
 
 ## ros bag play 
-ros2 bag play /perception_dataset/2026_02_11_convoy/bag_file_2026_02_08_test1_ben_shemen/bag_file_2026_02_08_10_14_59_0.mcap -l -r 0.5
+ros2 bag play /perception_dataset/2026_02_11_convoy/bag_file_2026_02_08_test1_ben_shemen/bag_file_2026_02_08_10_14_59_0.mcap -l -r 0.5  --clock-topics-all
 
 ## Dependencies
 

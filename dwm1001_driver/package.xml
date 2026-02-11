@@ -8,6 +8,7 @@
   <license>Apache License 2.0</license>
 
   <depend>dwm1001_msg</depend>
+  <depend>geometry_msgs</depend>
   <depend>message_filters</depend>
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
